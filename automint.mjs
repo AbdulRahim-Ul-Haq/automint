@@ -17,6 +17,7 @@ import { supplyOf, isSoldOut } from './minter.mjs';
 import { fastMint } from './fire.mjs';
 import { checkEligibility, allowlistMint } from './allowlist.mjs';
 import { listWallets, newWallet, removeWallet, readKey, balances, fundWallets, sweepWallets } from './wallets.mjs';
+import { sendNfts } from './nft.mjs';
 
 const CFG = {
   token: process.env.TELEGRAM_TOKEN || '',
@@ -106,7 +107,8 @@ const HELP =
   '/newwallet &lt;name&gt; — generate one here\n' +
   '/mywallets — list + balances\n' +
   '/fund &lt;funder&gt; &lt;amount&gt; &lt;a,b|all&gt; — spread funds\n' +
-  '/sweep &lt;to&gt; &lt;a,b|all&gt; — pull funds back\n' +
+  '/sweep &lt;to&gt; &lt;a,b|all&gt; — pull ETH back\n' +
+  '/sendnft &lt;link&gt; &lt;to&gt; &lt;a,b|all&gt; — send minted NFTs to your wallet\n' +
   '/removewallet &lt;name&gt;\n\n' +
   '<b>settings</b>\n' +
   '/set gas &lt;maxGwei&gt; &lt;tipGwei&gt; · /set lead &lt;ms&gt; · /set gaslimit &lt;n&gt;\n' +
@@ -205,6 +207,36 @@ async function handle(text) {
       const { ch, p } = await anyProvider(key);
       const res = await sweepWallets({ names, to, provider: p, chainId: ch.id, gas: gasOf() });
       return send('done:\n' + res.map((r) => `· ${esc(r.name)}: ${r.err ? '⛔ ' + esc(r.err) : r.skipped ? '— ' + esc(r.skipped) : '✅ ' + r.sent + ' ' + ch.sym}`).join('\n'));
+    } catch (e) { return send('⛔ ' + esc(String(e.message).slice(0, 150))); }
+  }
+  if (/^\/sendnft$/i.test(cmd)) {
+    // /sendnft <collectionLinkOr"contract chain"> <toAddress> [a,b|all]
+    // The collection tells us both the contract and the chain, so a raw contract
+    // must carry its chain: "0x… robinhood 0xYourWallet".
+    let contract = null, chainKey = null, to = null, whoSpec = 'all';
+    const linkMatch = text.match(/opensea\.io\/\S+/i);
+    const addrs = (text.match(/0x[a-fA-F0-9]{40}/g) || []);
+    if (linkMatch) {
+      try { const r = await resolve(linkMatch[0]); contract = r.contract; chainKey = r.chain.key; } catch (e) { return send('⛔ ' + esc(e.message)); }
+      to = addrs[0]; whoSpec = rest[rest.length - 1] && !/^0x/.test(rest[rest.length - 1]) ? rest[rest.length - 1] : 'all';
+    } else if (addrs.length >= 2) {
+      const chainWord = rest.find((w) => chainFor(w).ok);
+      contract = addrs[0]; to = addrs[1]; chainKey = chainWord || 'robinhood';
+      const last = rest[rest.length - 1];
+      whoSpec = last && !/^0x/.test(last) && !chainFor(last).ok ? last : 'all';
+    } else {
+      return send('use: /sendnft &lt;opensea-link&gt; &lt;toAddress&gt; [a,b|all]\nor: /sendnft &lt;contract&gt; &lt;chain&gt; &lt;toAddress&gt; [a,b|all]');
+    }
+    if (!to || !/^0x[a-fA-F0-9]{40}$/.test(to)) return send('I need a destination address to send the NFTs to.');
+    const names = resolveWalletNames(whoSpec);
+    if (!names.length) return send('no wallets selected.');
+    await send(`Looking for NFTs of <code>${short(contract)}</code> in ${names.length} wallet(s) on ${esc(chainKey)}, sending any found to ${short(to)}…`);
+    try {
+      const { ch, p } = await anyProvider(chainKey);
+      const res = await sendNfts({ names, contract, to, provider: p, chainId: ch.id, gas: gasOf(), readKey, say: (m) => log('[sendnft]', m) });
+      const lines = res.map((r) => r.err ? `· ${esc(r.name)}${r.tokenId ? ' #' + r.tokenId : ''}: ⛔ ${esc(r.err)}` : r.none ? `· ${esc(r.name)}: no NFTs held` : `· ${esc(r.name)} #${r.tokenId}: ✅ ${short(r.hash)}`).join('\n');
+      const moved = res.filter((r) => r.hash).length;
+      return send(`sent ${moved} NFT(s):\n${lines}`);
     } catch (e) { return send('⛔ ' + esc(String(e.message).slice(0, 150))); }
   }
 

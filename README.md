@@ -113,7 +113,8 @@ one mints its own `/qty` (subject to the drop's per-wallet limit) into its own
 address. Afterwards:
 
 ```
-/sweep 0xYourColdWallet all    ← pull funds back out of the hot wallets
+/sweep 0xYourColdWallet all              ← pull ETH out of the hot wallets
+/sendnft <link> 0xYourColdWallet all     ← send the minted NFTs to your wallet
 ```
 
 ---
@@ -140,7 +141,8 @@ address. Afterwards:
 | `/newwallet name` | Generate a wallet here |
 | `/mywallets` | List with balances |
 | `/fund funder amount a,b\|all` | Spread funds |
-| `/sweep toAddress a,b\|all` | Pull funds back |
+| `/sweep toAddress a,b\|all` | Pull ETH back |
+| `/sendnft link toAddress a,b\|all` | Send minted NFTs to your wallet |
 | `/removewallet name` | Delete a key file |
 
 **Settings**
