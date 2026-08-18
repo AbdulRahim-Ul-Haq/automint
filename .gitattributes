@@ -1,0 +1,8 @@
+# Shell scripts and JS must stay LF or they break on Linux/Mac
+*.sh text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf
+.env.example text eol=lf

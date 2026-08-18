@@ -1,0 +1,14 @@
+# secrets & state — NEVER commit these
+node_modules/
+keys/
+*.key
+*.pem
+automint.env
+.env
+drops.json
+settings.json
+*.log
+
+# os / editor
+.DS_Store
+Thumbs.db

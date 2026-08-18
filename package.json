@@ -1,0 +1,15 @@
+{
+  "name": "automint",
+  "version": "1.0.0",
+  "description": "Telegram-driven NFT public-mint sniper. Paste an OpenSea link, arm it, mint. Multi-wallet, pre-signed, on-chain resolution. Runs on your own device; keys never leave it.",
+  "type": "module",
+  "main": "automint.mjs",
+  "scripts": {
+    "start": "node automint.mjs",
+    "check": "node --check automint.mjs && node --check fire.mjs && node --check resolve.mjs && node --check wallets.mjs && node --check minter.mjs && node --check chains.mjs"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": { "ethers": "^6.13.4" },
+  "license": "MIT",
+  "keywords": ["nft", "mint", "opensea", "seadrop", "sniper", "telegram", "ethereum", "base"]
+}

@@ -1,0 +1,20 @@
+[Unit]
+Description=automint — Telegram-driven NFT auto-minter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/automint
+EnvironmentFile=/opt/automint/automint.env
+ExecStart=/usr/bin/node /opt/automint/automint.mjs
+Restart=always
+RestartSec=10
+User=root
+StandardOutput=append:/opt/automint/automint.log
+StandardError=append:/opt/automint/automint.log
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
