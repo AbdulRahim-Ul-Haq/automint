@@ -148,7 +148,7 @@ address. Afterwards:
 **Settings**
 | Command | Does |
 |---|---|
-| `/set gas maxGwei tipGwei` | Fee ceiling and tip |
+| `/set gas auto` \| `<gwei>` | Adaptive (default) or pin the fee |
 | `/set lead ms` | Fire this many ms early |
 | `/set gaslimit n` | Gas limit per mint |
 | `/settings` | Show all |
@@ -172,6 +172,17 @@ address. Afterwards:
   `automint.env`, restart.
 
 ---
+
+## Gas
+
+Gas is **adaptive by default**: the fee is derived from the chain's live base
+fee (`4× base`, capped), so it's right on any chain without configuration. A real
+SeaDrop mint uses ~154k gas — on a cheap chain like Robinhood (~0.02 gwei) that's
+about **half a cent**. The wallet only needs to hold that plus the mint price.
+
+Pin it by hand with `/set gas <gwei>` if you want, or `/set gas auto` to go back.
+Note the funds check reserves `gasLimit × maxFee` (what a node requires up front),
+which is a little above the actual spend — unused gas is never charged.
 
 ## Supported chains
 

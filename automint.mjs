@@ -10,7 +10,7 @@
 // a reboot — no terminal window to keep open.
 import fs from 'node:fs';
 import path from 'node:path';
-import { JsonRpcProvider, Contract, formatEther, parseEther, parseUnits } from 'ethers';
+import { JsonRpcProvider, Contract, formatEther, parseEther, parseUnits, formatUnits } from 'ethers';
 import { resolve, provider as providerFor, slugFromUrl } from './resolve.mjs';
 import { chainFor } from './chains.mjs';
 import { supplyOf, isSoldOut } from './minter.mjs';
@@ -48,17 +48,44 @@ const send = (text, extra = {}) => tg('sendMessage', { chat_id: CFG.owner, text,
 const load = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return d; } };
 let drops = load(CFG.dropsFile, []);
 let settings = load(CFG.settingsFile, {});
-// Defaults chosen for the chains we run on: fees are in gwei, tiny on L2s.
-settings = { maxFeeGwei: 5, priorityGwei: 1, gasLimit: 250000, leadMs: 1500, gasHeadroomEth: 0.003, defaultWallets: 'all', ...settings };
+// Gas is adaptive by default, not a fixed number, because "the right fee"
+// differs 1000x between chains: Robinhood runs at ~0.02 gwei, Ethereum can be
+// hundreds. So maxFee is derived from the LIVE base fee — base x multiplier,
+// capped — and the funds check reserves exactly gasLimit x that, not a made-up
+// constant. A real SeaDrop mint uses ~154k gas; at 0.02 gwei that is $0.006, so
+// on a cheap chain the reservation is a few cents, as it should be.
+//   maxFeeGwei = 0  -> adaptive (recommended). A number pins it by hand.
+settings = { maxFeeGwei: 0, gasMultiplier: 4, priorityGwei: 0, gasLimit: 250000, maxFeeCapGwei: 100, leadMs: 1500, defaultWallets: 'all', ...settings };
 const saveDrops = () => fs.writeFileSync(CFG.dropsFile, JSON.stringify(drops, null, 2));
 const saveSettings = () => fs.writeFileSync(CFG.settingsFile, JSON.stringify(settings, null, 2));
 let pending = null; // last resolved drop, awaiting /arm
 
-const gasOf = () => ({
-  maxFee: parseUnits(String(settings.maxFeeGwei), 'gwei'),
-  priority: parseUnits(String(settings.priorityGwei), 'gwei'),
-  limit: settings.gasLimit,
-});
+// Live-base-fee gas. Reads the chain's current fee, sets maxFee = base x
+// multiplier (so a spike between signing and firing still lands), a tiny
+// priority tip, and returns the exact reservation a node will check. A hand-set
+// maxFeeGwei overrides the adaptive path entirely.
+async function computeGas(provider) {
+  const limit = BigInt(settings.gasLimit);
+  let maxFee, priority;
+  if (settings.maxFeeGwei > 0) {
+    maxFee = parseUnits(String(settings.maxFeeGwei), 'gwei');
+    priority = parseUnits(String(settings.priorityGwei || 0), 'gwei');
+  } else {
+    let base = 0n;
+    try { base = (await provider.getFeeData()).gasPrice ?? 0n; } catch { /* fall back below */ }
+    if (base <= 0n) base = parseUnits('0.02', 'gwei'); // a sane floor if the feed is down
+    const cap = parseUnits(String(settings.maxFeeCapGwei), 'gwei');
+    maxFee = base * BigInt(settings.gasMultiplier);
+    if (maxFee > cap) maxFee = cap;
+    // priority: the user's fixed tip if set, else a 10% nudge over base
+    priority = settings.priorityGwei > 0 ? parseUnits(String(settings.priorityGwei), 'gwei') : base / 10n;
+    if (priority > maxFee) priority = maxFee;
+  }
+  // The reservation a node enforces before accepting the tx: gasLimit x maxFee.
+  // Plus 25% so a small base-fee wobble does not tip the wallet under.
+  const reserve = (limit * maxFee * 5n) / 4n;
+  return { maxFee, priority, limit: settings.gasLimit, reserve };
+}
 
 // which wallets a job uses: 'all', or a comma list of names
 function resolveWalletNames(spec) {
@@ -126,29 +153,40 @@ async function handle(text) {
 
   if (/^\/(start|help)$/i.test(cmd)) return send(HELP);
 
-  if (/^\/settings$/i.test(cmd))
+  if (/^\/settings$/i.test(cmd)) {
+    // show the gas that WOULD be used on robinhood right now, so the numbers
+    // are real rather than abstract
+    let live = '';
+    try {
+      const g = await computeGas(await providerFor(chainFor('robinhood')));
+      live = `\nright now on Robinhood: maxFee ${Number(formatUnits(g.maxFee, 'gwei')).toFixed(3)} gwei · reserve ${formatEther(g.reserve)} ETH per wallet`;
+    } catch { /* offline is fine */ }
     return send(
       `<b>settings</b>\n` +
-      `gas ceiling   ${settings.maxFeeGwei} gwei\n` +
-      `priority tip  ${settings.priorityGwei} gwei\n` +
+      `gas mode      ${settings.maxFeeGwei > 0 ? `fixed ${settings.maxFeeGwei} gwei` : `adaptive (${settings.gasMultiplier}× live base fee, cap ${settings.maxFeeCapGwei} gwei)`}\n` +
+      `priority tip  ${settings.priorityGwei > 0 ? settings.priorityGwei + ' gwei' : 'auto'}\n` +
       `gas limit     ${settings.gasLimit}\n` +
       `early-fire    ${settings.leadMs} ms\n` +
-      `gas headroom  ${settings.gasHeadroomEth} (native)\n` +
-      `spend ceiling ${CFG.maxSpendEth} per wallet (server-side, not settable here)`,
+      `spend ceiling ${CFG.maxSpendEth} per wallet (server-side, not settable here)` +
+      live,
     );
+  }
 
   if (/^\/set$/i.test(cmd)) {
     const [k, ...vals] = rest;
     if (/^gas$/i.test(k)) {
+      // /set gas auto  -> adaptive; /set gas <maxGwei> [tipGwei] -> fixed
+      if (/^auto$/i.test(vals[0] || '')) { settings.maxFeeGwei = 0; saveSettings(); return send('gas is adaptive again — maxFee tracks the live base fee.'); }
       const [mx, tip] = vals.map(Number);
-      if (!(mx > 0) || !(tip >= 0)) return send('use: /set gas &lt;maxGwei&gt; &lt;tipGwei&gt;');
-      settings.maxFeeGwei = mx; settings.priorityGwei = tip; saveSettings();
-      return send(`gas ceiling ${mx} gwei, tip ${tip} gwei.`);
+      if (!(mx > 0)) return send('use: /set gas auto  (recommended) — or /set gas &lt;maxGwei&gt; [tipGwei] to pin it');
+      settings.maxFeeGwei = mx; if (tip >= 0) settings.priorityGwei = tip; saveSettings();
+      return send(`gas pinned: maxFee ${mx} gwei${tip >= 0 ? `, tip ${tip} gwei` : ''}. /set gas auto to go back to adaptive.`);
     }
+    if (/^mult(iplier)?$/i.test(k)) { const n = Number(vals[0]); if (!(n >= 1)) return send('use: /set mult &lt;n&gt; (maxFee = n × base fee)'); settings.gasMultiplier = n; saveSettings(); return send(`adaptive multiplier ${n}× base fee.`); }
+    if (/^cap$/i.test(k)) { const n = Number(vals[0]); if (!(n > 0)) return send('use: /set cap &lt;gwei&gt;'); settings.maxFeeCapGwei = n; saveSettings(); return send(`adaptive fee cap ${n} gwei.`); }
     if (/^lead$/i.test(k)) { const n = Number(vals[0]); if (!(n >= 0)) return send('use: /set lead &lt;ms&gt;'); settings.leadMs = n; saveSettings(); return send(`early-fire ${n} ms.`); }
     if (/^gaslimit$/i.test(k)) { const n = Number(vals[0]); if (!(n >= 21000)) return send('use: /set gaslimit &lt;n&gt;'); settings.gasLimit = n; saveSettings(); return send(`gas limit ${n}.`); }
-    if (/^headroom$/i.test(k)) { const n = Number(vals[0]); if (!(n >= 0)) return send('use: /set headroom &lt;eth&gt;'); settings.gasHeadroomEth = n; saveSettings(); return send(`gas headroom ${n}.`); }
-    return send('settable: gas, lead, gaslimit, headroom');
+    return send('settable: gas (auto|&lt;gwei&gt;), mult, cap, lead, gaslimit');
   }
 
   // ── wallets ─────────────────────────────────────────────────────────────
@@ -192,7 +230,7 @@ async function handle(text) {
     await send(`Funding ${targets.length} wallet(s) with ${amount} each from ${esc(funder)} on ${armedChain}…`);
     try {
       const { ch, p } = await anyProvider(armedChain);
-      const res = await fundWallets({ funderKey: fr.wallet.privateKey, targets, amountEth: amount, provider: p, chainId: ch.id, gas: gasOf() });
+      const res = await fundWallets({ funderKey: fr.wallet.privateKey, targets, amountEth: amount, provider: p, chainId: ch.id, gas: await computeGas(p) });
       return send('done:\n' + res.results.map((r) => `· ${esc(r.name)}: ${r.err ? '⛔ ' + esc(r.err) : '✅ ' + short(r.hash)}`).join('\n'));
     } catch (e) { return send('⛔ ' + esc(String(e.message).slice(0, 150))); }
   }
@@ -205,7 +243,7 @@ async function handle(text) {
     await send(`Sweeping ${names.length} wallet(s) to ${short(to)} on ${key}…`);
     try {
       const { ch, p } = await anyProvider(key);
-      const res = await sweepWallets({ names, to, provider: p, chainId: ch.id, gas: gasOf() });
+      const res = await sweepWallets({ names, to, provider: p, chainId: ch.id, gas: await computeGas(p) });
       return send('done:\n' + res.map((r) => `· ${esc(r.name)}: ${r.err ? '⛔ ' + esc(r.err) : r.skipped ? '— ' + esc(r.skipped) : '✅ ' + r.sent + ' ' + ch.sym}`).join('\n'));
     } catch (e) { return send('⛔ ' + esc(String(e.message).slice(0, 150))); }
   }
@@ -233,7 +271,7 @@ async function handle(text) {
     await send(`Looking for NFTs of <code>${short(contract)}</code> in ${names.length} wallet(s) on ${esc(chainKey)}, sending any found to ${short(to)}…`);
     try {
       const { ch, p } = await anyProvider(chainKey);
-      const res = await sendNfts({ names, contract, to, provider: p, chainId: ch.id, gas: gasOf(), readKey, say: (m) => log('[sendnft]', m) });
+      const res = await sendNfts({ names, contract, to, provider: p, chainId: ch.id, gas: await computeGas(p), readKey, say: (m) => log('[sendnft]', m) });
       const lines = res.map((r) => r.err ? `· ${esc(r.name)}${r.tokenId ? ' #' + r.tokenId : ''}: ⛔ ${esc(r.err)}` : r.none ? `· ${esc(r.name)}: no NFTs held` : `· ${esc(r.name)} #${r.tokenId}: ✅ ${short(r.hash)}`).join('\n');
       const moved = res.filter((r) => r.hash).length;
       return send(`sent ${moved} NFT(s):\n${lines}`);
@@ -396,9 +434,12 @@ async function runArmed(job) {
     }
     if (!signers.length) { job.state = 'failed'; job.result = 'no usable wallet keys at run time'; saveDrops(); return send(`⛔ <b>${esc(job.name)}</b>: no usable wallet keys`); }
 
-    // funds + supply gate up front (our edge, kept)
+    // funds + supply gate up front (our edge, kept). The gas reserve is the
+    // real one now — gasLimit x the live maxFee — not a fixed guess, so on a
+    // cheap chain a wallet holding a few cents of gas is not falsely rejected.
+    const gas = await computeGas(p);
     const cost = cfg.priceWei * BigInt(job.quantity);
-    const headroom = parseEther(String(settings.gasHeadroomEth));
+    const headroom = gas.reserve;
     const under = [];
     for (const s of signers) {
       const bal = await p.getBalance(s.wallet.address);
@@ -422,7 +463,7 @@ async function runArmed(job) {
       startMs: cfg.startMs,
       endMs: cfg.endMs,
       leadMs: settings.leadMs,
-      gas: gasOf(),
+      gas,
       checkSoldOut: async () => { const s = await supplyOf(p, job.contract, null); return { soldOut: isSoldOut(s), total: s.total, max: s.max }; },
       say: (m) => log(`[${job.name}]`, m),
     });
@@ -458,7 +499,7 @@ async function runArmedAllowlist(job) {
     const res = await allowlistMint({
       signers, slug: job.slug, chainId: ch.id, chainIdentifier: job.chainIdentifier,
       nft: job.contract, quantity: job.quantity, stageIndex: job.stageIndex,
-      urls: ch.rpcs, gas: gasOf(), startMs: job.startMs, leadMs: Math.min(settings.leadMs, 500),
+      urls: ch.rpcs, gas: await computeGas(await providerFor(ch)), startMs: job.startMs, leadMs: Math.min(settings.leadMs, 500),
       say: (m) => log(`[${job.name}]`, m),
     });
     job.state = res.ok ? 'minted' : 'failed';
