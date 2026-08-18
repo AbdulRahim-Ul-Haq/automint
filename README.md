@@ -24,6 +24,9 @@ device and never travel through Telegram.**
 - **Won't waste gas on a dead drop.** It checks supply before firing and, while
   waiting, watches for an earlier phase selling out — if it does, it tells you
   and sends *nothing*.
+- **Allowlist stages too.** Public mints are built from on-chain data; presale
+  and FCFS stages are minted by signing in to OpenSea as your wallet (its own
+  key, no browser session). See below.
 - **Runs headless.** No terminal window to keep open. Close your laptop; if it's
   on a Pi it just keeps going. Control it from Telegram.
 
@@ -128,6 +131,8 @@ address. Afterwards:
 | `/list` | Armed drops |
 | `/cancel n` | Remove an armed drop |
 | `/check` | Re-read supply for armed drops |
+| `/allowlist` | Check which of your wallets are on the presale list |
+| `/armallowlist n` | Arm an authenticated presale/allowlist mint for stage n |
 
 **Wallets** — keys stay on the machine, never in chat
 | Command | Does |
@@ -172,15 +177,36 @@ Robinhood, Ethereum, Base, Arbitrum, Optimism, Polygon, Zora, Blast, ApeChain,
 Abstract. A drop on any other chain is reported clearly rather than mis-fired.
 Add one by appending an entry to `chains.mjs`.
 
+## Allowlist / presale mints
+
+Public stages are unsigned, so automint builds their calldata itself. Allowlist
+and FCFS stages are different: SeaDrop needs a per-wallet signature that only
+OpenSea's servers produce. automint can get it — by signing in to OpenSea **as
+your wallet** (SIWE: your wallet's own key signs a login message; no browser
+session, no pasted token) and asking OpenSea to build the mint.
+
+```
+(paste the collection link)
+/allowlist            ← logs each wallet in, shows which stages it's eligible for
+/armallowlist 2       ← arm the authenticated mint for the stage you're eligible for
+```
+
+Two honest limits, both surfaced in the bot:
+
+- **It uses OpenSea's private API**, which they can change without notice. When
+  that happens it stops working until updated — that's the nature of it.
+- **The transaction OpenSea returns is never blind-signed.** Its calldata is
+  decoded and checked — right mint selector, your quantity, crediting your
+  wallet — before your key ever touches it.
+
+It only works for a wallet genuinely on the list; eligibility is checked first,
+so a non-eligible wallet gets a plain "not eligible", never a wasted transaction.
+
 ## What it does not do
 
-- **Allowlist / FCFS phases.** Those need a per-wallet signature from OpenSea's
-  own servers, which can't be built from on-chain data. Only **public** phases
-  are mintable here. (This is the same limit both tools this was modelled on
-  hit — it's a property of how allowlists work, not a missing feature.)
 - **Custom mint contracts** it doesn't recognise get "needs a hand-written
-  adapter" rather than a wrong guess. SeaDrop and plain `mint()`/`publicMint()`
-  work out of the box.
+  adapter" rather than a wrong guess. SeaDrop (public and allowlist) and plain
+  `mint()`/`publicMint()` work out of the box.
 
 ## Credit
 

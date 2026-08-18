@@ -11,10 +11,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { JsonRpcProvider, Contract, formatEther, parseEther, parseUnits } from 'ethers';
-import { resolve, provider as providerFor } from './resolve.mjs';
+import { resolve, provider as providerFor, slugFromUrl } from './resolve.mjs';
 import { chainFor } from './chains.mjs';
 import { supplyOf, isSoldOut } from './minter.mjs';
 import { fastMint } from './fire.mjs';
+import { checkEligibility, allowlistMint } from './allowlist.mjs';
 import { listWallets, newWallet, removeWallet, readKey, balances, fundWallets, sweepWallets } from './wallets.mjs';
 
 const CFG = {
@@ -98,7 +99,9 @@ const HELP =
   '/qty &lt;n&gt; — how many per wallet\n' +
   '/wallets &lt;all|a,b&gt; — which wallets this drop uses\n' +
   '/price &lt;eth&gt; — set price if the contract hides it\n' +
-  '/list · /cancel &lt;n&gt; · /check — armed drops\n\n' +
+  '/list · /cancel &lt;n&gt; · /check — armed drops\n' +
+  '/allowlist — check which wallets are on the presale list\n' +
+  '/armallowlist &lt;stageIndex&gt; — arm an authenticated presale mint\n\n' +
   '<b>wallets</b> (keys stay on this machine, never in chat)\n' +
   '/newwallet &lt;name&gt; — generate one here\n' +
   '/mywallets — list + balances\n' +
@@ -260,6 +263,59 @@ async function handle(text) {
     );
   }
 
+  // ── allowlist / presale (authenticated OpenSea path) ──────────────────────
+  if (/^\/allowlist$/i.test(cmd)) {
+    if (!pending) return send('Resolve a drop first, then /allowlist to check presale eligibility.');
+    const slug = pending.slug || slugFromUrl(pending.sourceUrl || '');
+    if (!slug) return send('This drop came in as a raw contract, so I have no OpenSea slug to check the presale with. Send the collection LINK instead.');
+    const names = resolveWalletNames(pending.walletSpec);
+    if (!names.length) return send('No wallets selected. /newwallet or /wallets first.');
+    const signers = names.map((n) => ({ name: n, wallet: readKey(n).wallet })).filter((x) => x.wallet);
+    await send(`Signing in to OpenSea as ${signers.length} wallet(s) to check the presale list — each signs with its own key, nothing leaves this machine…`);
+    try {
+      const rows = await checkEligibility({ signers, slug, chainId: pending.chain.id });
+      let out = `<b>presale eligibility — ${esc(pending.name)}</b>`;
+      let anyEligible = false;
+      for (const r of rows) {
+        if (!r.ok) { out += `\n· <b>${esc(r.name)}</b>: ⛔ ${esc(r.err)}`; continue; }
+        const elig = r.stages.filter((st) => st.eligible);
+        if (elig.length) { anyEligible = true; out += `\n· <b>${esc(r.name)}</b> ${short(r.address)}: ✅ stage(s) ${elig.map((st) => `${st.index} (${esc(st.type)})`).join(', ')}`; }
+        else out += `\n· <b>${esc(r.name)}</b> ${short(r.address)}: not on any presale list`;
+      }
+      out += anyEligible ? '\n\nArm one with /armallowlist &lt;stageIndex&gt;' : '\n\nNo wallet is on a presale list. Use /arm for the public stage instead.';
+      pending.eligibilityChecked = rows;
+      return send(out);
+    } catch (e) { return send('⛔ ' + esc(String(e.message).slice(0, 200))); }
+  }
+  if (/^\/armallowlist$/i.test(cmd)) {
+    if (!pending) return send('Resolve a drop first.');
+    const slug = pending.slug || slugFromUrl(pending.sourceUrl || '');
+    if (!slug) return send('No OpenSea slug for this drop — send the collection link.');
+    const stageIndex = Number(arg);
+    if (!Number.isInteger(stageIndex)) return send('use: /armallowlist &lt;stageIndex&gt; (numbers come from /allowlist)');
+    const rows = pending.eligibilityChecked || [];
+    if (!rows.length) return send('Run /allowlist first so I know which wallets are eligible.');
+    const eligibleNames = [];
+    let startMs = null, chainIdentifier = null, nft = null, perWallet = 0, price = null;
+    for (const r of rows) {
+      if (!r.ok) continue;
+      const st = r.stages.find((x) => x.index === stageIndex && x.eligible);
+      if (st) { eligibleNames.push(r.name); startMs = st.startMs; chainIdentifier = r.chainIdentifier; nft = r.nft; perWallet = st.perWallet; price = st.price; }
+    }
+    if (!eligibleNames.length) return send(`No selected wallet is eligible for stage ${stageIndex}. /allowlist to check.`);
+    if (perWallet && pending.quantity > perWallet) return send(`Stage ${stageIndex} allows ${perWallet} per wallet.`);
+    const job = {
+      id: Date.now(), name: `${pending.name} (presale ${stageIndex})`, contract: nft || pending.contract,
+      chainKey: pending.chain.key, chainName: pending.chain.name, sym: pending.chain.sym,
+      mode: 'allowlist', slug, stageIndex, chainIdentifier, startMs,
+      quantity: pending.quantity || 1, walletNames: eligibleNames, state: 'armed',
+    };
+    drops.push(job); saveDrops(); pending = null;
+    send(`✅ Armed <b>${esc(job.name)}</b> — authenticated presale\n${eligibleNames.length} eligible wallet(s)${price ? ` · ${price.unit} ${esc(price.symbol)} each` : ''}\nopens ${when(startMs)}\n\n<i>Presale mints fetch a signed transaction from OpenSea's private API when the stage opens — a little slower than public, and reliant on their API. I'll message you the result.</i>`);
+    runArmedAllowlist(job);
+    return;
+  }
+
   if (/^\/arm$/i.test(cmd)) {
     if (!pending) return send('Nothing to arm — send an OpenSea link first.');
     const c = pending.cfg;
@@ -285,7 +341,7 @@ async function handle(text) {
     await send('Looking it up on-chain…');
     try {
       const r = await resolve(text.trim());
-      pending = { ...r, quantity: 1, walletSpec: settings.defaultWallets };
+      pending = { ...r, quantity: 1, walletSpec: settings.defaultWallets, sourceUrl: text.trim(), slug: slugFromUrl(text.trim()) };
       return send(card(r, resolveWalletNames(pending.walletSpec)));
     } catch (e) { return send('⛔ ' + esc(e.message)); }
   }
@@ -354,6 +410,41 @@ async function runArmed(job) {
   }
 }
 
+// The authenticated presale path. Different from runArmed: it logs each eligible
+// wallet into OpenSea, waits for the stage, fetches the SIGNED transaction, and
+// only then signs and fires. Cannot pre-sign — the signature does not exist
+// until OpenSea builds it at stage open.
+async function runArmedAllowlist(job) {
+  try {
+    const { ch } = await anyProvider(job.chainKey);
+    const signers = [];
+    for (const name of job.walletNames) {
+      const r = readKey(name);
+      if (r.wallet) signers.push({ wallet: r.wallet, name });
+    }
+    if (!signers.length) { job.state = 'failed'; job.result = 'no usable wallet keys'; saveDrops(); return send(`⛔ <b>${esc(job.name)}</b>: no usable wallet keys`); }
+    const res = await allowlistMint({
+      signers, slug: job.slug, chainId: ch.id, chainIdentifier: job.chainIdentifier,
+      nft: job.contract, quantity: job.quantity, stageIndex: job.stageIndex,
+      urls: ch.rpcs, gas: gasOf(), startMs: job.startMs, leadMs: Math.min(settings.leadMs, 500),
+      say: (m) => log(`[${job.name}]`, m),
+    });
+    job.state = res.ok ? 'minted' : 'failed';
+    job.result = res.msg;
+    saveDrops();
+    if (res.ok) {
+      const lines = res.runs.filter((r) => r.ok).map((r) => `· ${short(r.name)} — block ${r.block}, tx <code>${short(r.hash)}</code>`).join('\n');
+      await send(`🎉 <b>MINTED ${esc(job.name)}</b>\n${esc(res.msg)}\n${lines}`);
+    } else {
+      const why = res.runs?.map((r) => `· ${short(r.name)}: ${esc(r.msg || r.kind)}`).join('\n') || esc(res.msg);
+      await send(`❌ <b>${esc(job.name)}</b> — presale did not mint\n${why}`);
+    }
+  } catch (e) {
+    job.state = 'failed'; job.result = String(e.message); saveDrops();
+    await send(`⛔ <b>${esc(job.name)}</b> presale errored: ${esc(String(e.message).slice(0, 200))}`);
+  }
+}
+
 // ── main loop ──────────────────────────────────────────────────────────────
 let offset = 0;
 async function poll() {
@@ -372,5 +463,5 @@ async function poll() {
 log('automint starting');
 const { ok } = listWallets();
 await send(`🟢 automint up.\n${ok.length} wallet(s), ${drops.filter((d) => d.state === 'armed').length} armed.\nSend an OpenSea link or /help.`);
-for (const d of drops.filter((x) => x.state === 'armed')) runArmed(d);
+for (const d of drops.filter((x) => x.state === 'armed')) (d.mode === 'allowlist' ? runArmedAllowlist : runArmed)(d);
 for (;;) { await poll().catch((e) => log('poll error', e?.message)); await new Promise((r) => setTimeout(r, 400)); }
