@@ -124,13 +124,16 @@ export async function waitUntil(targetMs, leadMs, onTick, abort) {
 // ── the whole fast mint ─────────────────────────────────────────────────────
 // signers: [{ wallet, quantity }]. builtFor(qty) -> {to,data,value}. The plan
 // is identical per wallet except the value scales with that wallet's quantity.
-export async function fastMint({ signers, urls, chainId, builtFor, startMs, endMs, leadMs = 1500, gas, checkSoldOut, say }) {
+export async function fastMint({ signers, urls, chainId, builtFor, startMs, endMs, leadMs = 0, gas, checkSoldOut, say,
+  retryMs = 400, retryWindowMs = 90_000, maxAttempts = 60 }) {
   urls = await verifyChain(urls, chainId);
   if (!urls.length) return { ok: false, kind: 'rpc', msg: 'no endpoint is on the right chain' };
 
   const provider = new JsonRpcProvider(urls[0], chainId, { staticNetwork: true });
 
   // ── during the wait: nonce, fees, signatures ──────────────────────────────
+  // The signer and the built tx are KEPT, not just the signed bytes, so a
+  // too-early first shot can be re-signed with a fresh nonce and fired again.
   const prepared = [];
   for (const s of signers) {
     const w = s.wallet.connect(provider);
@@ -140,14 +143,11 @@ export async function fastMint({ signers, urls, chainId, builtFor, startMs, endM
       to: built.to, data: built.data, value: built.value, nonce,
       maxFeePerGas: gas.maxFee, maxPriorityFeePerGas: gas.priority, gasLimit: gas.limit, type: 2, chainId,
     });
-    prepared.push({ address: w.address, quantity: s.quantity, raw, value: built.value });
+    prepared.push({ w, address: w.address, quantity: s.quantity, built, raw });
   }
   say?.(`pre-signed ${prepared.length} transaction(s) — nothing left to compute at fire time`);
 
   // ── wait for the stage, watching supply so a sell-out ends it early ───────
-  // A sold-out signal during the wait returns a clean result rather than
-  // throwing: the whole point is that zero transactions get sent, so this must
-  // not surface as an exception the caller has to remember to catch.
   if (startMs) {
     let warned = false;
     let soldOut = null;
@@ -164,39 +164,74 @@ export async function fastMint({ signers, urls, chainId, builtFor, startMs, endM
   }
   if (endMs && Date.now() > endMs) return { ok: false, kind: 'closed', msg: 'the window had already closed' };
 
-  // ── warm, then blast the pre-signed bytes ─────────────────────────────────
   await warm(urls);
-  say?.(`window open — blasting ${prepared.length} tx to ${urls.length} endpoint(s)`);
-  const fired = prepared.map((p) => ({ ...p, ...blast(p.raw, urls) }));
 
-  // ── did any endpoint actually take each tx? ───────────────────────────────
-  const out = [];
-  for (const f of fired) {
-    const results = await f.settled;
-    const accepted = wasAccepted(results);
-    out.push({ address: f.address, hash: f.hash, accepted, value: f.value, reasons: [...new Set(results.map((r) => r.err).filter(Boolean))] });
-  }
-  const anyAccepted = out.some((o) => o.accepted);
-  if (!anyAccepted) {
-    const reasons = [...new Set(out.flatMap((o) => o.reasons))];
-    let hint = '';
-    if (reasons.some((r) => /less than block base fee|underpriced/i.test(r))) hint = ' — your max fee is under the chain base fee; raise it';
-    if (reasons.some((r) => /insufficient funds/i.test(r))) hint = ' — a wallet cannot cover mint + gas';
-    return { ok: false, kind: 'rejected', msg: `rejected by every endpoint${hint}`, reasons, wallets: out };
+  // A shared, throttled sold-out check so N wallets retrying in parallel do not
+  // hammer the RPC. Cached for 1.5s — plenty for a 12-second sellout.
+  let soldCache = { at: 0, sold: false, total: null, max: null };
+  const soldOutNow = async () => {
+    if (!checkSoldOut) return false;
+    if (Date.now() - soldCache.at < 1500) return soldCache.sold;
+    try { const s = await checkSoldOut(); soldCache = { at: Date.now(), sold: !!s.soldOut, total: s.total, max: s.max }; }
+    catch { soldCache.at = Date.now(); }
+    return soldCache.sold;
+  };
+
+  const deadline = Math.min(endMs || Infinity, Date.now() + retryWindowMs);
+
+  // ── one wallet: fire, then keep firing until it lands ─────────────────────
+  // This is the fix for the PunkzBroker miss: the first shot can be mined a
+  // moment before the stage flips live (a NotActive revert on a chain that
+  // includes instantly). Instead of giving up, re-sign with a fresh nonce and
+  // fire again — the retry lands the instant the stage is actually open, which
+  // is exactly the 12-second window a fast public sells out in.
+  async function runWallet(prep) {
+    let lastHash = null;
+    let attempts = 0;
+    let raw = prep.raw; // the pre-signed first shot
+    let lastReason = '';
+    for (;;) {
+      const b = blast(raw, urls);
+      lastHash = b.hash;
+      b.settled.then((rs) => { const e = rs.map((r) => r.err).filter(Boolean); if (e.length) lastReason = e[0]; }).catch(() => {});
+      const rc = await waitReceipt(lastHash, urls[0], Math.max(1200, retryMs * 3));
+      if (rc?.status === 1) return { address: prep.address, ok: true, hash: lastHash, block: rc.block };
+
+      attempts += 1;
+      if (attempts >= maxAttempts) return { address: prep.address, ok: false, kind: 'gave-up', hash: lastHash, reason: lastReason || 'reverted repeatedly' };
+      if (Date.now() > deadline) return { address: prep.address, ok: false, kind: 'timeout', hash: lastHash, reason: lastReason || 'window closed before it landed' };
+      if (await soldOutNow()) return { address: prep.address, ok: false, kind: 'sold-out', reason: `sold out (${soldCache.total}/${soldCache.max})` };
+
+      // Re-sign with the current pending nonce and the same calldata, then go
+      // again. The nonce MUST come from the raw RPC, not provider.getTransaction
+      // Count(): ethers caches that high-level call, so every retry would re-sign
+      // the IDENTICAL transaction (same nonce -> same bytes -> "already known",
+      // never landing). The raw send bypasses the cache and reflects the true
+      // pending nonce, which a reverted first shot has already advanced.
+      try {
+        const nonce = Number(await provider.send('eth_getTransactionCount', [prep.address, 'pending']));
+        raw = await prep.w.signTransaction({
+          to: prep.built.to, data: prep.built.data, value: prep.built.value, nonce,
+          maxFeePerGas: gas.maxFee, maxPriorityFeePerGas: gas.priority, gasLimit: gas.limit, type: 2, chainId,
+        });
+      } catch (e) { lastReason = String(e?.shortMessage || e?.message || e).slice(0, 120); }
+      await sleep(retryMs);
+    }
   }
 
-  // ── receipts, only for the ones that got in ───────────────────────────────
-  const minted = [];
-  for (const o of out.filter((x) => x.accepted)) {
-    const rc = await waitReceipt(o.hash, urls[0], 90_000);
-    minted.push({ address: o.address, hash: o.hash, block: rc?.block ?? null, status: rc?.status ?? null, pos: rc?.pos ?? null });
-  }
-  const wins = minted.filter((m) => m.status === 1);
+  say?.(`window open — firing ${prepared.length} wallet(s), retrying until landed or sold out`);
+  const runs = await Promise.all(prepared.map((p) => runWallet(p).catch((e) => ({ address: p.address, ok: false, kind: 'error', reason: String(e?.message || e).slice(0, 120) }))));
+
+  const wins = runs.filter((r) => r.ok);
+  const minted = runs.map((r) => ({ address: r.address, hash: r.hash ?? null, status: r.ok ? 1 : 0, block: r.block ?? null }));
   return {
     ok: wins.length > 0,
-    kind: wins.length ? 'minted' : 'accepted-no-confirm',
+    kind: wins.length ? 'minted' : (runs.some((r) => r.kind === 'sold-out') ? 'sold-out' : runs[0]?.kind || 'failed'),
     minted,
-    wallets: out,
-    msg: wins.length ? `${wins.length}/${prepared.length} wallet(s) minted` : 'transactions were accepted but none confirmed successfully',
+    wallets: runs,
+    reasons: [...new Set(runs.filter((r) => !r.ok).map((r) => r.reason).filter(Boolean))],
+    msg: wins.length
+      ? `${wins.length}/${prepared.length} wallet(s) minted`
+      : (runs.some((r) => r.kind === 'sold-out') ? `sold out before we landed a mint` : `no wallet minted — ${runs[0]?.reason || 'unknown'}`),
   };
 }

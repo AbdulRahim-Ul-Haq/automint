@@ -55,7 +55,7 @@ let settings = load(CFG.settingsFile, {});
 // constant. A real SeaDrop mint uses ~154k gas; at 0.02 gwei that is $0.006, so
 // on a cheap chain the reservation is a few cents, as it should be.
 //   maxFeeGwei = 0  -> adaptive (recommended). A number pins it by hand.
-settings = { maxFeeGwei: 0, gasMultiplier: 4, priorityGwei: 0, gasLimit: 250000, maxFeeCapGwei: 100, leadMs: 1500, defaultWallets: 'all', ...settings };
+settings = { maxFeeGwei: 0, gasMultiplier: 4, priorityGwei: 0, gasLimit: 250000, maxFeeCapGwei: 100, leadMs: 0, defaultWallets: 'all', ...settings };
 const saveDrops = () => fs.writeFileSync(CFG.dropsFile, JSON.stringify(drops, null, 2));
 const saveSettings = () => fs.writeFileSync(CFG.settingsFile, JSON.stringify(settings, null, 2));
 let pending = null; // last resolved drop, awaiting /arm
