@@ -81,23 +81,44 @@ export async function waitReceipt(hash, url, timeoutMs = 60_000) {
   return null;
 }
 
-// ── verify the endpoints are the chain we think they are ────────────────────
-// Signing a Base tx and blasting it at an Ethereum node is a great way to leak
-// a nonce and lose a mint. Drop any endpoint on the wrong chain rather than
-// trusting the list.
-export async function verifyChain(urls, chainId) {
-  const checked = await Promise.all(
+// ── sort the endpoints into readable vs send-only ───────────────────────────
+// Not every endpoint answers reads. A chain's SEQUENCER typically accepts only
+// eth_sendRawTransaction — it is the fastest path to get a tx included, and it
+// returns "method not found" for eth_chainId. Dropping it (as a naive chain-id
+// filter does) throws away the best submit route.
+//
+//   readable  — returned our chainId: safe for reads (nonce, receipts) AND blast
+//   sendOnly  — up, but does not answer eth_chainId (a sequencer): blast only
+//   dropped   — wrong chainId, or unreachable
+//
+// Blasting a signed tx at a send-only endpoint we cannot chain-check is safe: an
+// EIP-1559 signature binds the chainId, so a wrong-chain node rejects it rather
+// than leaking anything. Every url here already comes from our own config.
+export async function classifyEndpoints(urls, chainId) {
+  const readable = [];
+  const sendOnly = [];
+  await Promise.all(
     urls.map(async (u) => {
       try {
         const j = await (await fetch(u, {
           method: 'POST', headers: { 'content-type': 'application/json' },
           body: '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}',
         })).json();
-        return parseInt(j.result, 16) === chainId ? u : null;
-      } catch { return null; }
+        if (j?.result != null) {
+          if (parseInt(j.result, 16) === chainId) readable.push(u); // else wrong chain -> drop
+        } else if (j?.error) {
+          sendOnly.push(u); // up, but no eth_chainId -> a sequencer; keep for blasting
+        }
+      } catch { /* unreachable -> drop */ }
     }),
   );
-  return checked.filter(Boolean);
+  return { readable, sendOnly };
+}
+
+// Back-compat: the readable endpoints only (used by the allowlist path, which
+// needs to read as well as send).
+export async function verifyChain(urls, chainId) {
+  return (await classifyEndpoints(urls, chainId)).readable;
 }
 
 // ── precise wait ────────────────────────────────────────────────────────────
@@ -126,10 +147,14 @@ export async function waitUntil(targetMs, leadMs, onTick, abort) {
 // is identical per wallet except the value scales with that wallet's quantity.
 export async function fastMint({ signers, urls, chainId, builtFor, startMs, endMs, leadMs = 0, gas, checkSoldOut, say,
   retryMs = 400, retryWindowMs = 90_000, maxAttempts = 60 }) {
-  urls = await verifyChain(urls, chainId);
-  if (!urls.length) return { ok: false, kind: 'rpc', msg: 'no endpoint is on the right chain' };
+  const { readable, sendOnly } = await classifyEndpoints(urls, chainId);
+  if (!readable.length) return { ok: false, kind: 'rpc', msg: 'no readable endpoint is on the right chain' };
+  // Reads (nonce, receipts) go to a verified full node; blasts go to EVERYTHING,
+  // including the send-only sequencer — the fastest route to inclusion.
+  const readUrl = readable[0];
+  const blastUrls = [...readable, ...sendOnly];
 
-  const provider = new JsonRpcProvider(urls[0], chainId, { staticNetwork: true });
+  const provider = new JsonRpcProvider(readUrl, chainId, { staticNetwork: true });
 
   // ── during the wait: nonce, fees, signatures ──────────────────────────────
   // The signer and the built tx are KEPT, not just the signed bytes, so a
@@ -164,7 +189,7 @@ export async function fastMint({ signers, urls, chainId, builtFor, startMs, endM
   }
   if (endMs && Date.now() > endMs) return { ok: false, kind: 'closed', msg: 'the window had already closed' };
 
-  await warm(urls);
+  await warm(blastUrls);
 
   // A shared, throttled sold-out check so N wallets retrying in parallel do not
   // hammer the RPC. Cached for 1.5s — plenty for a 12-second sellout.
@@ -191,10 +216,10 @@ export async function fastMint({ signers, urls, chainId, builtFor, startMs, endM
     let raw = prep.raw; // the pre-signed first shot
     let lastReason = '';
     for (;;) {
-      const b = blast(raw, urls);
+      const b = blast(raw, blastUrls);
       lastHash = b.hash;
       b.settled.then((rs) => { const e = rs.map((r) => r.err).filter(Boolean); if (e.length) lastReason = e[0]; }).catch(() => {});
-      const rc = await waitReceipt(lastHash, urls[0], Math.max(1200, retryMs * 3));
+      const rc = await waitReceipt(lastHash, readUrl, Math.max(1200, retryMs * 3));
       if (rc?.status === 1) return { address: prep.address, ok: true, hash: lastHash, block: rc.block };
 
       attempts += 1;
@@ -219,7 +244,7 @@ export async function fastMint({ signers, urls, chainId, builtFor, startMs, endM
     }
   }
 
-  say?.(`window open — firing ${prepared.length} wallet(s), retrying until landed or sold out`);
+  say?.(`window open — firing ${prepared.length} wallet(s) at ${blastUrls.length} endpoint(s)${sendOnly.length ? ' (incl. sequencer)' : ''}, retrying until landed or sold out`);
   const runs = await Promise.all(prepared.map((p) => runWallet(p).catch((e) => ({ address: p.address, ok: false, kind: 'error', reason: String(e?.message || e).slice(0, 120) }))));
 
   const wins = runs.filter((r) => r.ok);
